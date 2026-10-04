@@ -3,6 +3,11 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  migrateDb, applyBatch, applyOp, resolveConflict,
+  pendingConflicts, conflictCount, currentCalibration, calibrationHistory,
+  findItem, newBatchId
+} from "./sync.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "model-rigging-calibration.json");
@@ -46,7 +51,8 @@ async function loadDb() {
     await mkdir(dirname(dbPath), { recursive: true });
     await writeFile(dbPath, JSON.stringify(seed, null, 2));
   }
-  return JSON.parse(await readFile(dbPath, "utf8"));
+  const db = JSON.parse(await readFile(dbPath, "utf8"));
+  return migrateDb(db); // 旧数据没有版本 → 迁移成首版
 }
 async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
@@ -62,7 +68,7 @@ function html(res, text) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(text);
 }
-function newId() { return "MR-" + Date.now(); }
+function onlineOpId() { return "OP-ONLINE-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8); }
 function computeStats(items) {
   const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
   for (const item of items) {
@@ -72,7 +78,8 @@ function computeStats(items) {
 }
 function summarize(item) {
   const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
+  const pending = (item.conflicts || []).filter(c => c.status === "pending").length;
+  return { ...item, logCount, conflictCount: pending, currentCalibration: currentCalibration(item) };
 }
 function page() {
   return `<!doctype html>
@@ -106,10 +113,18 @@ function page() {
     </section>
     <section>
       <div class="stats" id="stats"></div>
+      <div class="panel" id="conflictsPanel" style="margin-bottom:14px"><h2>待处理冲突 <span id="conflictCount" class="pill">0</span></h2><div id="conflictList" class="meta">暂无冲突</div></div>
       <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
       <div class="panel"><h2>创建模型后可拆分帆索任务，逐条记录松紧状态、调整备注和完成时间。</h2><div class="grid" id="cards"></div></div>
     </section>
   </main>
+  <div id="calModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:50;align-items:center;justify-content:center">
+    <div class="panel" style="max-width:560px;width:90%;max-height:80vh;overflow:auto">
+      <h2>校准记录 · <span id="calTitle"></span></h2>
+      <div id="calBody"></div>
+      <div style="margin-top:12px"><button class="secondary" onclick="document.querySelector('#calModal').style.display='none'">关闭</button></div>
+    </div>
+  </div>
   <script>
     const fields = [["code","模型编号","text"],["shipType","船型","text"],["scale","比例","text"],["mastCount","桅杆数量","number"],["riggingMaterial","帆索材料","text"],["owner","负责人","text"],["dueDate","交付日期","date"]];
     const stages = ["待检查","校准中","待复核","已交付"];
@@ -132,20 +147,69 @@ function page() {
     }
     function render() {
       itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
+      const conflictTotal = items.reduce((n, i) => n + (i.conflictCount || 0), 0);
       const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
-      statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
+      statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('')
+        + '<div class="stat"><span>冲突数</span><strong id="statConflict">'+conflictTotal+'</strong></div>';
+      document.querySelector('#conflictCount').textContent = conflictTotal;
       const status = document.querySelector('#statusFilter').value;
       const q = document.querySelector('#search').value.trim();
       const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
       cards.innerHTML = visible.map(item => cardHtml(item)).join('');
       document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
       document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
+      document.querySelectorAll('[data-cal]').forEach(btn => btn.onclick = () => showCalibrations(btn.dataset.cal));
+      renderConflicts();
+    }
+    async function renderConflicts() {
+      const list = await api('/api/sync/conflicts');
+      const el = document.querySelector('#conflictList');
+      if (!list.length) { el.innerHTML = '暂无冲突'; return; }
+      el.innerHTML = list.map(c => {
+        const label = c.kind === 'existence'
+          ? ('存在性冲突 · ' + (c.targetKind === 'item' ? '模型' : '任务') + ' ' + (c.targetId || ''))
+          : ('字段冲突 · ' + (c.taskId ? '任务 ' : '') + c.field);
+        const detail = c.kind === 'existence'
+          ? (c.reason === 'item_removed_no_resurrect' ? '模型已移除，迟到回传不得复活'
+             : c.reason === 'task_removed_no_resurrect' ? '任务已移除，迟到回传不得复活'
+             : '任务新增后被迟到回传移除，保留存活')
+          : ('当前值 <b>'+(c.currentValue ?? '')+'</b> · 待处理值 <b>'+(c.proposedValue ?? '')+'</b>');
+        return '<div style="padding:8px 0;border-top:1px solid var(--line)">'
+          + '<div><b>'+label+'</b> <span class="pill">'+(c.itemCode || c.itemId)+'</span> <span class="meta">来源 '+(c.sources||[]).join('、')+' · 基准v'+c.baseVersion+'</span></div>'
+          + '<div class="meta" style="margin:4px 0">'+detail+'</div>'
+          + '<div style="display:flex;gap:8px;margin-top:4px">'
+          + (c.kind === 'existence'
+             ? '<button data-resolve="'+c.id+'" data-choice="current" class="secondary">维持现状</button>'
+             : '<button data-resolve="'+c.id+'" data-choice="current" class="secondary">保留当前</button><button data-resolve="'+c.id+'" data-choice="proposed">采用待处理值</button>')
+          + '</div></div>';
+      }).join('');
+      el.querySelectorAll('[data-resolve]').forEach(btn => btn.onclick = async () => {
+        await api('/api/conflicts/'+btn.dataset.resolve+'/resolve', { method:'POST', body: JSON.stringify({ choice: btn.dataset.choice }) });
+        await load();
+      });
+    }
+    async function showCalibrations(id) {
+      const data = await api('/api/items/'+id+'/calibrations');
+      document.querySelector('#calTitle').textContent = id;
+      const cur = data.current;
+      const curHtml = cur ? '<div style="padding:8px;border:1px solid var(--accent);border-radius:6px;margin-bottom:10px">'
+        + '<div><b>当前有效结论</b> <span class="pill">依赖v'+cur.dependsOnVersion+'</span></div>'
+        + '<div style="margin-top:4px">'+cur.result.summary+'</div>'
+        + '<div class="meta" style="margin-top:4px">桅杆数 '+cur.inputs.mastCount+' · 材料 '+cur.inputs.riggingMaterial+' · 索位 '+(cur.inputs.positions||[]).join('、')+'</div>'
+        + '</div>' : '<div class="meta">暂无有效结论</div>';
+      const histHtml = (data.history||[]).filter(c => !c.valid).map(c => '<div style="padding:6px 0;border-top:1px solid var(--line)" class="meta">'
+        + '<span class="pill">v'+c.dependsOnVersion+' 已失效</span> '+c.result.summary+'</div>').join('');
+      document.querySelector('#calBody').innerHTML = curHtml + '<div class="meta" style="margin-top:8px">历史快照（原快照仍可查）</div>' + (histHtml || '<div class="meta">无</div>');
+      document.querySelector('#calModal').style.display = 'flex';
     }
     function cardHtml(item) {
       const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
       const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
       const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
+      const cal = item.currentCalibration;
+      const calHtml = cal ? '<div class="meta" style="margin-top:4px">校准：'+cal.result.summary+'</div>' : '';
+      const conflictBadge = (item.conflictCount || 0) > 0 ? '<span class="pill" style="background:var(--warn);color:#fff;border-color:var(--warn)">冲突 '+item.conflictCount+'</span>' : '';
+      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+conflictBadge+main+tasks+calHtml+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><div style="display:flex;gap:8px"><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><button class="secondary" data-cal="'+(item.id || item.code)+'">校准记录</button></div><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
     }
     async function load() { items = await api('/api/items'); render(); }
     createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
@@ -162,20 +226,21 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const db = await loadDb();
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
+    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.filter(i => !i._deleted).map(summarize));
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建模型" }] };
-      item.tasks = [];
-      db.items.unshift(item);
+      const op = { opId: onlineOpId(), source: "在线", baseVersion: 0, type: "create", payload: input };
+      applyOp(db, op);
       await saveDb(db);
-      return send(res, 201, item);
+      return send(res, 201, findItem(db, input.code));
     }
     const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
     if (patch && req.method === "PATCH") {
       const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
+      const input = await body(req);
+      const op = { opId: onlineOpId(), source: "在线", baseVersion: item.version, itemId: item.id || item.code, type: "update", payload: input };
+      applyOp(db, op);
       item.logs ||= [];
       item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
       await saveDb(db);
@@ -196,15 +261,85 @@ const server = http.createServer(async (req, res) => {
       const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
       const input = await body(req);
-      item.logs ||= [];
-      item.tasks ||= [];
-      item.tasks.push({ id: "T-" + Date.now(), position: input.position, tension: input.tension, status: "待检查", logs: [{ at: new Date().toISOString(), note: input.note || "新增帆索任务" }] });
-      item.status = "校准中";
-      item.logs.push({ at: new Date().toISOString(), step: "帆索", note: input.position + " · " + input.tension });
+      const op = { opId: onlineOpId(), source: "在线", baseVersion: item.version, itemId: item.id || item.code, type: "addTask", payload: input };
+      applyOp(db, op);
       await saveDb(db);
       return send(res, 201, item);
     }
-    if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
+    if (req.method === "GET" && url.pathname === "/api/stats") {
+      return send(res, 200, { ...computeStats(db.items.filter(i => !i._deleted)), conflictCount: conflictCount(db) });
+    }
+
+    // ---- 断网回传合并 ----
+    if (req.method === "POST" && url.pathname === "/api/sync/batch") {
+      const input = await body(req);
+      const batchId = input.batchId || newBatchId();
+      const batch = { batchId, ops: input.ops || [], status: "pending", createdAt: new Date().toISOString() };
+      db.pendingBatches.push(batch);
+      await saveDb(db); // 先持久化现场批次
+      const results = applyBatch(db, batch);
+      batch.status = "applied";
+      batch.results = results;
+      // 写入失败模拟：保留现场批次，按原操作号重试
+      if (req.headers["x-simulate-fail"] === "1") {
+        return send(res, 500, { error: "write_failed", batchId, message: "现场批次已保留，可按原操作号重试" });
+      }
+      await saveDb(db);
+      return send(res, 200, { batchId, results });
+    }
+    if (req.method === "POST" && url.pathname === "/api/sync/batch/retry") {
+      const { batchId } = await body(req);
+      const batch = db.pendingBatches.find(b => b.batchId === batchId);
+      if (!batch) return send(res, 404, { error: "batch_not_found" });
+      if (batch.status === "applied") {
+        return send(res, 200, { batchId, results: batch.results, retried: false, message: "批次已应用" });
+      }
+      const results = applyBatch(db, batch);
+      batch.status = "applied";
+      batch.results = results;
+      await saveDb(db);
+      return send(res, 200, { batchId, results, retried: true });
+    }
+    if (req.method === "GET" && url.pathname === "/api/sync/ops") {
+      return send(res, 200, db.ops || []);
+    }
+    if (req.method === "GET" && url.pathname === "/api/sync/conflicts") {
+      return send(res, 200, pendingConflicts(db));
+    }
+    const resolve = url.pathname.match(/^\/api\/conflicts\/([^/]+)\/resolve$/);
+    if (resolve && req.method === "POST") {
+      const { choice } = await body(req);
+      const result = resolveConflict(db, resolve[1], choice || "current");
+      if (!result) return send(res, 404, { error: "conflict_not_found" });
+      await saveDb(db);
+      return send(res, 200, result.conflict);
+    }
+    const cals = url.pathname.match(/^\/api\/items\/([^/]+)\/calibrations$/);
+    if (cals && req.method === "GET") {
+      const item = db.items.find(x => x.id === cals[1] || x.code === cals[1]);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      return send(res, 200, {
+        current: currentCalibration(item),
+        history: calibrationHistory(item).filter(c => !c.valid),
+        conflictCount: (item.conflicts || []).filter(c => c.status === "pending").length
+      });
+    }
+    const snaps = url.pathname.match(/^\/api\/items\/([^/]+)\/snapshots$/);
+    if (snaps && req.method === "GET") {
+      const item = db.items.find(x => x.id === snaps[1] || x.code === snaps[1]);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      return send(res, 200, item.snapshots || []);
+    }
+    const cal = url.pathname.match(/^\/api\/items\/([^/]+)\/calibrate$/);
+    if (cal && req.method === "POST") {
+      const item = db.items.find(x => x.id === cal[1] || x.code === cal[1]);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      const op = { opId: onlineOpId(), source: "在线", baseVersion: item.version, itemId: item.id || item.code, type: "calibrate", payload: {} };
+      applyOp(db, op);
+      await saveDb(db);
+      return send(res, 200, currentCalibration(item));
+    }
+
     send(res, 404, { error: "not_found" });
   } catch (error) {
     send(res, 500, { error: error.message });
